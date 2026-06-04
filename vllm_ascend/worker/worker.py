@@ -524,12 +524,6 @@ class NPUWorker(WorkerBase):
             if get_pp_group().world_size == 2:
                 self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
-            # Edge 不开 SP 时，Cloud 可能 pad 到其 tp_size，截断回实际长度
-            if not enable_sp() and self.model_runner.edge_cloud_cfg.mode != "embedding_only":
-                actual_num_tokens = scheduler_output.total_num_scheduled_tokens
-                for k, v in tensor_dict.items():
-                    if isinstance(v, torch.Tensor) and v.shape[0] > actual_num_tokens:
-                        tensor_dict[k] = v[:actual_num_tokens]
             if enable_sp():
                 tensor_dict = {
                     k: sequence_parallel_chunk(v)
