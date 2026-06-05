@@ -28,6 +28,20 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 class AscendQwen3NextAttention(Qwen3NextAttention):
     def forward(self, positions: torch.Tensor, output: torch.Tensor, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
+        # DEBUG: verify whether SP all-gather is effective inside graph
+        try:
+            from vllm.forward_context import get_forward_context
+            _capturing = get_forward_context().capturing
+        except Exception:
+            _capturing = "ERR"
+        print(
+            f"[DEBUG] capturing={_capturing} "
+            f"layer={self.layer_idx} "
+            f"flash_comm_v1={getattr(_EXTRA_CTX, 'flash_comm_v1_enabled', 'N/A')} "
+            f"hidden_states.shape={hidden_states.shape} "
+            f"qkv.shape={qkv.shape}",
+            flush=True,
+        )
         if "qwen3_5" in self.config.model_type:
             cos_sin = self.rotary_emb.cos_sin_cache[positions]
             if cos_sin.device != qkv.device:
