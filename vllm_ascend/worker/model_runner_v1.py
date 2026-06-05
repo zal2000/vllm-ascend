@@ -34,6 +34,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
@@ -254,6 +255,7 @@ class ExecuteModelState(NamedTuple):
 
 
 
+@support_torch_compile
 class EdgeCloudSegment(torch.nn.Module):
     """执行指定层区间 [start_layer, end_layer) 的轻量 nn.Module。
 
@@ -278,6 +280,7 @@ class EdgeCloudSegment(torch.nn.Module):
         end_layer: int,
         is_first_segment: bool | None = None,
         is_last_segment: bool | None = None,
+        vllm_config: VllmConfig | None = None,
     ):
         super().__init__()
         self._edge_model = model
@@ -684,7 +687,14 @@ class NPUModelRunner(GPUModelRunner):
         边云场景下所有模型均已在加载阶段通过对应 patch 文件注入
         forward_edge_cloud_segment，因此直接委托即可，无需额外 fallback。
         """
-        return EdgeCloudSegment(model, start_layer, end_layer, is_first_segment, is_last_segment)
+        return EdgeCloudSegment(
+            model,
+            start_layer,
+            end_layer,
+            is_first_segment=is_first_segment,
+            is_last_segment=is_last_segment,
+            vllm_config=self.vllm_config,
+        )
 
     def _wrap_segment_if_needed(
         self,
