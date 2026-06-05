@@ -275,6 +275,7 @@ class EdgeCloudSegment(torch.nn.Module):
 
     def __init__(
         self,
+        *,
         model: torch.nn.Module,
         start_layer: int,
         end_layer: int,
@@ -688,9 +689,9 @@ class NPUModelRunner(GPUModelRunner):
         forward_edge_cloud_segment，因此直接委托即可，无需额外 fallback。
         """
         return EdgeCloudSegment(
-            model,
-            start_layer,
-            end_layer,
+            model=model,
+            start_layer=start_layer,
+            end_layer=end_layer,
             is_first_segment=is_first_segment,
             is_last_segment=is_last_segment,
             vllm_config=self.vllm_config,
