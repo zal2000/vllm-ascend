@@ -3175,6 +3175,33 @@ class NPUModelRunner(GPUModelRunner):
         assert self.intermediate_tensors is not None
         tp = self.vllm_config.parallel_config.tensor_parallel_size
 
+        # [DBG-SYNC] dump src/dst state BEFORE copy
+        _dbg_sync_id = getattr(self, "_dbg_sync_id", 0)
+        self._dbg_sync_id = _dbg_sync_id + 1
+        _ec_role = (
+            self.edge_cloud_cfg.role if self._edge_cloud_enabled else "std"
+        )
+        if sync_self and intermediate_tensors is not None:
+            torch.npu.current_stream().synchronize()
+            for k, v in intermediate_tensors.items():
+                _buf = self.intermediate_tensors[k]
+                try:
+                    _src_n1 = v[:1].float().norm().item()
+                    _src_f4 = v.flatten()[:4].tolist()
+                    _dst_n1 = _buf[:1].float().norm().item()
+                    _dst_f4 = _buf.flatten()[:4].tolist()
+                except Exception as _e:
+                    _src_n1 = _src_f4 = _dst_n1 = _dst_f4 = f"<err:{_e}>"
+                print(
+                    f"[DBG-SYNC] role={_ec_role} id={_dbg_sync_id} key={k} "
+                    f"sync_self={sync_self} num_tokens={num_tokens} tp={tp} "
+                    f"src_ptr={v.data_ptr():x} src_shape={tuple(v.shape)} "
+                    f"src_norm1={_src_n1} src_first4={_src_f4} "
+                    f"dst_ptr={_buf.data_ptr():x} dst_shape={tuple(_buf.shape)} "
+                    f"dst_norm1_before={_dst_n1} dst_first4_before={_dst_f4}",
+                    flush=True,
+                )
+
         if sync_self:
             assert intermediate_tensors is not None, (
                 "sync_and_slice_intermediate_tensors received None; "
@@ -3185,6 +3212,18 @@ class NPUModelRunner(GPUModelRunner):
                     copy_len = num_tokens
                     self.intermediate_tensors[k][:copy_len].copy_(
                         v[:copy_len], non_blocking=True
+                    )
+                # [DBG-SYNC-AFTER] dump dst state AFTER copy
+                torch.npu.current_stream().synchronize()
+                for k in intermediate_tensors.tensors:
+                    _buf = self.intermediate_tensors[k]
+                    print(
+                        f"[DBG-SYNC-AFTER] role={_ec_role} id={_dbg_sync_id} "
+                        f"key={k} branch=embedding_only "
+                        f"dst_ptr={_buf.data_ptr():x} "
+                        f"dst_norm1_after={_buf[:1].float().norm().item():.6f} "
+                        f"dst_first4_after={_buf.flatten()[:4].tolist()}",
+                        flush=True,
                     )
                 return IntermediateTensors(
                     {
@@ -3198,8 +3237,20 @@ class NPUModelRunner(GPUModelRunner):
                     self.intermediate_tensors[k][:copy_len].copy_(
                         v[:copy_len], non_blocking=True
                     )
+                # [DBG-SYNC-AFTER] dump dst state AFTER copy
+                torch.npu.current_stream().synchronize()
+                for k in intermediate_tensors.tensors:
+                    _buf = self.intermediate_tensors[k]
+                    print(
+                        f"[DBG-SYNC-AFTER] role={_ec_role} id={_dbg_sync_id} "
+                        f"key={k} branch=else "
+                        f"dst_ptr={_buf.data_ptr():x} "
+                        f"dst_norm1_after={_buf[:1].float().norm().item():.6f} "
+                        f"dst_first4_after={_buf.flatten()[:4].tolist()}",
+                        flush=True,
+                    )
 
-        return IntermediateTensors(
+        _ret = IntermediateTensors(
             {
                 k: v[: (num_tokens + tp - 1) // tp]
                 if enable_sp()
@@ -3207,6 +3258,16 @@ class NPUModelRunner(GPUModelRunner):
                 for k, v in self.intermediate_tensors.items()
             }
         )
+        # [DBG-SYNC-RET] dump the slice actually returned to caller
+        for k, v in _ret.items():
+            print(
+                f"[DBG-SYNC-RET] role={_ec_role} id={_dbg_sync_id} key={k} "
+                f"ret_ptr={v.data_ptr():x} ret_shape={tuple(v.shape)} "
+                f"ret_norm1={v[:1].float().norm().item():.6f} "
+                f"ret_first4={v.flatten()[:4].tolist()}",
+                flush=True,
+            )
+        return _ret
 
     def sync_and_gather_intermediate_tensors(
         self,
