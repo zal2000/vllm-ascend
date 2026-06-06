@@ -512,7 +512,6 @@ class NPUWorker(WorkerBase):
             self.profiler.step()
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
-        print(f"edge-first/cloud exec finish, hidden.shape:{output['hidden_states'].shape}")
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -541,7 +540,6 @@ class NPUWorker(WorkerBase):
             # 确保 HCCL 回传数据在 NPU 上可用后再启动 segment_e forward
             torch.npu.synchronize()
             output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
-            print(f"edge-last exec finish, hidden.shape:{output.shape}")
             if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
                 return output
             return output

@@ -2917,6 +2917,18 @@ class NPUModelRunner(GPUModelRunner):
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                # [EXP-A] Clone segment_a output to detach from graph_pool memory.
+                # Worker layer will replace `output.tensors` with `_all_gather_tensor_dict`
+                # result before isend. Without cloning, the replacement mutates the
+                # IntermediateTensors object that the ACLGraphWrapper holds as `entry.output`
+                # (a weak ref into the graph_pool), so the next graph replay observes
+                # the all-gathered (×tp) tensor instead of the original SP shard,
+                # causing shape to ×tp each iteration.
+                if isinstance(hidden_states, IntermediateTensors):
+                    hidden_states = IntermediateTensors(
+                        {k: v.clone() for k, v in hidden_states.items()},
+                        kv_connector_output=hidden_states.kv_connector_output,
+                    )
                 # [DBG-EC] dump segment_a output (force sync so norm is meaningful)
                 torch.npu.current_stream().synchronize()
                 _hs = (
@@ -3117,6 +3129,17 @@ class NPUModelRunner(GPUModelRunner):
                 intermediate_tensors=intermediate_tensors,
                 **model_kwargs,
             )
+            # [EXP-A] Clone segment_c output to detach from graph_pool memory.
+            # Same reason as segment_a in _edge_cloud_forward_edge: the cloud worker
+            # also calls _all_gather_tensor_dict on output.tensors before isend,
+            # mutating the IntermediateTensors that ACLGraphWrapper holds as entry.output.
+            # Without cloning, every replay observes the previous iter's all-gathered
+            # (×tp) tensor as input to all-gather again, shape ×tp each iter.
+            if isinstance(hidden_states, IntermediateTensors):
+                hidden_states = IntermediateTensors(
+                    {k: v.clone() for k, v in hidden_states.items()},
+                    kv_connector_output=hidden_states.kv_connector_output,
+                )
             # [DBG-EC] dump segment_c output (will be sent back to edge)
             torch.npu.current_stream().synchronize()
             _hs_out = hidden_states["hidden_states"]
