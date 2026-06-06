@@ -1989,6 +1989,21 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 if self.pcp_size > 1:
                     num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
+                # [DBG-NT] dump per-call num_tokens / intermediate_tensors state
+                self._dbg_call_id = getattr(self, "_dbg_call_id", 0)
+                _ec_role = (
+                    self.edge_cloud_cfg.role if self._edge_cloud_enabled else "std"
+                )
+                _it_is_none = intermediate_tensors is None
+                print(
+                    f"[DBG-NT] role={_ec_role} call_id={self._dbg_call_id} "
+                    f"sched_total={scheduler_output.total_num_scheduled_tokens} "
+                    f"input_batch_num_reqs={self.input_batch.num_reqs} "
+                    f"num_tokens_unpadded={num_tokens_unpadded} "
+                    f"intermediate_tensors_is_none={_it_is_none}",
+                    flush=True,
+                )
+                self._dbg_call_id += 1
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
                 if self.cascade_attn_enabled and not self.parallel_config.enable_dbo:
@@ -2859,6 +2874,43 @@ class NPUModelRunner(GPUModelRunner):
                     f"positions_first8={_pos_first}",
                     flush=True,
                 )
+                # [DBG-BUF] inspect the persistent buffers segment_a actually reads
+                try:
+                    _buf_iid = (
+                        self.input_ids.gpu[:8].tolist()
+                        if hasattr(self, "input_ids") and hasattr(self.input_ids, "gpu")
+                        else None
+                    )
+                except Exception as _e:
+                    _buf_iid = f"<err:{_e}>"
+                try:
+                    _buf_emb = (
+                        self.inputs_embeds.gpu[:2, :4].float().tolist()
+                        if hasattr(self, "inputs_embeds")
+                        and hasattr(self.inputs_embeds, "gpu")
+                        else None
+                    )
+                except Exception as _e:
+                    _buf_emb = f"<err:{_e}>"
+                _buf_iid_ptr = (
+                    self.input_ids.gpu.data_ptr()
+                    if hasattr(self, "input_ids") and hasattr(self.input_ids, "gpu")
+                    else 0
+                )
+                _buf_emb_ptr = (
+                    self.inputs_embeds.gpu.data_ptr()
+                    if hasattr(self, "inputs_embeds")
+                    and hasattr(self.inputs_embeds, "gpu")
+                    else 0
+                )
+                print(
+                    f"[DBG-BUF] iter={self._dbg_iter} "
+                    f"self.input_ids.gpu_ptr={_buf_iid_ptr:x} "
+                    f"self.input_ids.gpu[:8]={_buf_iid} "
+                    f"self.inputs_embeds.gpu_ptr={_buf_emb_ptr:x} "
+                    f"self.inputs_embeds.gpu[:2,:4]={_buf_emb}",
+                    flush=True,
+                )
                 hidden_states = seg_a(
                     input_ids=input_ids,
                     positions=positions,
@@ -3221,6 +3273,17 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
+        # [DBG-PAD] dump pad pipeline: input → sp-pad → cudagraph-dispatch
+        _ec_role = (
+            self.edge_cloud_cfg.role if self._edge_cloud_enabled else "std"
+        )
+        print(
+            f"[DBG-PAD] role={_ec_role} num_tokens_in={num_tokens} "
+            f"after_sp_pad={num_tokens_padded} "
+            f"after_dispatch={batch_descriptor.num_tokens} "
+            f"cg_mode={cudagraph_mode}",
+            flush=True,
+        )
         num_tokens_padded = batch_descriptor.num_tokens
         if enable_sp(self.vllm_config):
             assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (
