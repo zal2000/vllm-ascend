@@ -512,7 +512,7 @@ class NPUWorker(WorkerBase):
             self.profiler.step()
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
-        print(f"edge-first/cloud exec finish, hidden.shape:{intermediate_tensors['hidden_states'].shape}")
+        print(f"edge-first/cloud exec finish, hidden.shape:{output['hidden_states'].shape}")
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
