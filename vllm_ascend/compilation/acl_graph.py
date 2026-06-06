@@ -124,6 +124,24 @@ class ACLGraphWrapper:
         if hasattr(aclgraph_runtime_mode, "decode_mode"):
             aclgraph_runtime_mode = aclgraph_runtime_mode.decode_mode()
 
+        # [DBG-WRAPPER] dump which path (graph replay vs eager fallback)
+        _entry = self.concrete_aclgraph_entries.get(batch_descriptor)
+        _will_fallback = (
+            aclgraph_runtime_mode == CUDAGraphMode.NONE
+            or aclgraph_runtime_mode != self.runtime_mode
+        )
+        print(
+            f"[DBG-WRAPPER] runnable_id={id(self.runnable):x} "
+            f"runtime_mode_ctx={aclgraph_runtime_mode} "
+            f"self.runtime_mode={self.runtime_mode} "
+            f"batch_desc={batch_descriptor} "
+            f"entry_exists={_entry is not None} "
+            f"entry_graph_is_none={(_entry is None) or (_entry.aclgraph is None)} "
+            f"capturing_ctx={getattr(forward_context, 'capturing', False)} "
+            f"path={'eager' if _will_fallback else ('capture' if (_entry is None or _entry.aclgraph is None) else 'replay')}",
+            flush=True,
+        )
+
         if aclgraph_runtime_mode == CUDAGraphMode.NONE or aclgraph_runtime_mode != self.runtime_mode:
             # CUDAGraphMode.NONE could mean the profile run, a warmup run, or
             # running without aclgraphs.
