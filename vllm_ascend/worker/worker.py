@@ -487,7 +487,7 @@ class NPUWorker(WorkerBase):
                     comm_handles=comm_handles,
                     comm_postprocess=comm_postprocess,
                 )
-                print(f"cloud recv tensors, hidden.shape:{intermediate_tensors["hidden_states"].shape}")
+                print(f"cloud recv tensors, hidden.shape:{intermediate_tensors['hidden_states'].shape}")
             elif not get_pp_group().is_first_rank:
                 # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
                 # it will conflict with the all-gather operation in flashcomm1.
@@ -524,9 +524,9 @@ class NPUWorker(WorkerBase):
                 output.tensors = self._all_gather_tensor_dict(output.tensors)
             if get_pp_group().world_size == 2:
                 self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
-                print(f"edge send tensors, hidden.shape:{output.tensors["hidden_states"].shape}")
+                print(f"edge send tensors, hidden.shape:{output.tensors['hidden_states'].shape}")
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
-            print(f"edge recv tensors, hidden.shape:{tensor_dict["hidden_states"].shape}")
+            print(f"edge recv tensors, hidden.shape:{tensor_dict['hidden_states'].shape}")
             if enable_sp():
                 tensor_dict = {
                     k: sequence_parallel_chunk(v)
