@@ -2844,12 +2844,54 @@ class NPUModelRunner(GPUModelRunner):
                         layer_indices=list(range(0, self.head_k)),
                         graph_wrapper=seg_a,
                     )
+                # [DBG-EC] dump segment_a inputs
+                self._dbg_iter = getattr(self, "_dbg_iter", 0)
+                _capturing = getattr(forward_context, "capturing", False)
+                if input_ids is not None:
+                    _iid_first = input_ids[:8].tolist()
+                else:
+                    _iid_first = None
+                _pos_first = positions[:8].tolist() if positions is not None else None
+                _iid_ptr = input_ids.data_ptr() if input_ids is not None else 0
+                print(
+                    f"[EDGE-A-IN] iter={self._dbg_iter} cap={_capturing} "
+                    f"input_ids_ptr={_iid_ptr:x} input_ids_first8={_iid_first} "
+                    f"positions_first8={_pos_first}",
+                    flush=True,
+                )
                 hidden_states = seg_a(
                     input_ids=input_ids,
                     positions=positions,
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                # [DBG-EC] dump segment_a output (force sync so norm is meaningful)
+                torch.npu.current_stream().synchronize()
+                _hs = (
+                    hidden_states["hidden_states"]
+                    if isinstance(hidden_states, IntermediateTensors)
+                    else hidden_states
+                )
+                _res = (
+                    hidden_states["residual"]
+                    if isinstance(hidden_states, IntermediateTensors)
+                    and "residual" in hidden_states.tensors
+                    else None
+                )
+                print(
+                    f"[EDGE-A-OUT] iter={self._dbg_iter} cap={_capturing} "
+                    f"hs_ptr={_hs.data_ptr():x} hs_shape={tuple(_hs.shape)} "
+                    f"hs_norm={_hs.float().norm().item():.6f} "
+                    f"hs_first4={_hs.flatten()[:4].tolist()} "
+                    + (
+                        f"res_ptr={_res.data_ptr():x} res_norm={_res.float().norm().item():.6f} "
+                        f"res_first4={_res.flatten()[:4].tolist()}"
+                        if _res is not None
+                        else "res=None"
+                    ),
+                    flush=True,
+                )
+                self._dbg_iter += 1
             finally:
                 # 恢复 layer_idx 前先同步当前流，确保 weight_prefetch 等
                 # 依赖 layer_idx 的异步任务已在正确层号下完成，防止后续段读到错层权重
@@ -2886,11 +2928,49 @@ class NPUModelRunner(GPUModelRunner):
                     layer_indices=tail_layer_indices,
                     graph_wrapper=seg_e,
                 )
+            # [DBG-EC] dump segment_e input (received from cloud)
+            self._dbg_iter_e = getattr(self, "_dbg_iter_e", 0)
+            _capturing = getattr(forward_context, "capturing", False)
+            _hs_in = intermediate_tensors["hidden_states"]
+            _res_in = (
+                intermediate_tensors["residual"]
+                if "residual" in intermediate_tensors.tensors
+                else None
+            )
+            print(
+                f"[EDGE-E-IN] iter={self._dbg_iter_e} cap={_capturing} "
+                f"hs_in_ptr={_hs_in.data_ptr():x} hs_in_shape={tuple(_hs_in.shape)} "
+                f"hs_in_norm={_hs_in.float().norm().item():.6f} "
+                f"hs_in_first4={_hs_in.flatten()[:4].tolist()} "
+                + (
+                    f"res_in_ptr={_res_in.data_ptr():x} "
+                    f"res_in_norm={_res_in.float().norm().item():.6f} "
+                    f"res_in_first4={_res_in.flatten()[:4].tolist()}"
+                    if _res_in is not None
+                    else "res_in=None"
+                ),
+                flush=True,
+            )
             hidden_states = seg_e(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 **model_kwargs,
             )
+            # [DBG-EC] dump segment_e output (final hidden_states before logits)
+            torch.npu.current_stream().synchronize()
+            _hs_out = (
+                hidden_states["hidden_states"]
+                if isinstance(hidden_states, IntermediateTensors)
+                else hidden_states
+            )
+            print(
+                f"[EDGE-E-OUT] iter={self._dbg_iter_e} cap={_capturing} "
+                f"hs_out_ptr={_hs_out.data_ptr():x} hs_out_shape={tuple(_hs_out.shape)} "
+                f"hs_out_norm={_hs_out.float().norm().item():.6f} "
+                f"hs_out_first4={_hs_out.flatten()[:4].tolist()}",
+                flush=True,
+            )
+            self._dbg_iter_e += 1
         finally:
             # segment_e 执行完毕后恢复原始 layer_idx
             if old_layer_idx is not None:
@@ -2945,11 +3025,69 @@ class NPUModelRunner(GPUModelRunner):
                     layer_indices=cloud_layer_indices,
                     graph_wrapper=seg_c,
                 )
+            # [DBG-EC] dump segment_c input (received from edge)
+            self._dbg_iter_c = getattr(self, "_dbg_iter_c", 0)
+            _capturing = getattr(forward_context, "capturing", False)
+            _hs_in = (
+                intermediate_tensors["hidden_states"]
+                if intermediate_tensors is not None
+                else None
+            )
+            _res_in = (
+                intermediate_tensors["residual"]
+                if intermediate_tensors is not None
+                and "residual" in intermediate_tensors.tensors
+                else None
+            )
+            if _hs_in is not None:
+                print(
+                    f"[CLOUD-C-IN] iter={self._dbg_iter_c} cap={_capturing} "
+                    f"hs_in_ptr={_hs_in.data_ptr():x} hs_in_shape={tuple(_hs_in.shape)} "
+                    f"hs_in_norm={_hs_in.float().norm().item():.6f} "
+                    f"hs_in_first4={_hs_in.flatten()[:4].tolist()} "
+                    + (
+                        f"res_in_ptr={_res_in.data_ptr():x} "
+                        f"res_in_norm={_res_in.float().norm().item():.6f} "
+                        f"res_in_first4={_res_in.flatten()[:4].tolist()}"
+                        if _res_in is not None
+                        else "res_in=None"
+                    ),
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[CLOUD-C-IN] iter={self._dbg_iter_c} cap={_capturing} "
+                    f"intermediate_tensors=None (warmup={in_warmup})",
+                    flush=True,
+                )
             hidden_states = seg_c(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 **model_kwargs,
             )
+            # [DBG-EC] dump segment_c output (will be sent back to edge)
+            torch.npu.current_stream().synchronize()
+            _hs_out = hidden_states["hidden_states"]
+            _res_out = (
+                hidden_states["residual"]
+                if "residual" in hidden_states.tensors
+                else None
+            )
+            print(
+                f"[CLOUD-C-OUT] iter={self._dbg_iter_c} cap={_capturing} "
+                f"hs_out_ptr={_hs_out.data_ptr():x} hs_out_shape={tuple(_hs_out.shape)} "
+                f"hs_out_norm={_hs_out.float().norm().item():.6f} "
+                f"hs_out_first4={_hs_out.flatten()[:4].tolist()} "
+                + (
+                    f"res_out_ptr={_res_out.data_ptr():x} "
+                    f"res_out_norm={_res_out.float().norm().item():.6f} "
+                    f"res_out_first4={_res_out.flatten()[:4].tolist()}"
+                    if _res_out is not None
+                    else "res_out=None"
+                ),
+                flush=True,
+            )
+            self._dbg_iter_c += 1
         finally:
             if old_layer_idx is not None:
                 _EXTRA_CTX.layer_idx = old_layer_idx
