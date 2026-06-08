@@ -1,6 +1,17 @@
+from typing import Any, Callable
+
 import torch
 from vllm.config import ParallelConfig, get_current_vllm_config
-from vllm.distributed.parallel_state import GroupCoordinator, get_tp_group, get_world_group, init_model_parallel_group
+from vllm.distributed.parallel_state import (
+    GroupCoordinator,
+    Handle,
+    TensorMetadata,
+    _split_tensor_dict,
+    get_pp_group,
+    get_tp_group,
+    get_world_group,
+    init_model_parallel_group,
+)
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import enable_dsa_cp_with_layer_shard, flashcomm2_enable
@@ -33,6 +44,34 @@ def init_ascend_model_parallel(
     if model_parallel_initialized():
         return
     assert torch.distributed.is_initialized()
+    global _MC2
+    if parallel_config.enable_edge_cloud:
+        # Edge-cloud mode has a non-uniform rank layout (edge + cloud),
+        # so the standard DP*PP*PCP*TP grid does not apply.
+        # Instead, initialize Ascend-specific groups aligned with the
+        # edge/cloud TP split established in ensure_model_parallel_initialized.
+        world_size = torch.distributed.get_world_size()
+        backend = torch.distributed.get_backend(get_world_group().device_group)
+        edge_npu_count = parallel_config.edge_npu_count
+
+        edge_ranks = list(range(edge_npu_count))
+        cloud_ranks = list(range(edge_npu_count, world_size))
+
+        _MC2 = init_model_parallel_group(
+            [edge_ranks, cloud_ranks],
+            get_world_group().local_rank,
+            backend,
+            group_name="mc2",
+        )
+
+        # Ascend-specific groups that are currently disabled by default
+        # in edge-cloud mode. If enabled in the future, they must follow
+        # the same edge/cloud separation principle:
+        #   _DYNAMIC_EPLB, _FC3_QUANT_X,
+        #   _OTP, _LMTP, _EMBED_TP, _MLP_TP,
+        #   _FLASHCOMM2_OTP, _FLASHCOMM2_ODP,
+        #   _SHARD_WEIGHT, _P_TP
+        return
     world_size = torch.distributed.get_world_size()
     backend = torch.distributed.get_backend(get_world_group().device_group)
     global_tp_size = parallel_config.tensor_parallel_size
@@ -92,7 +131,6 @@ def init_ascend_model_parallel(
     )
     group_ranks = [x.tolist() for x in group_ranks]
 
-    global _MC2
     _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
 
     if get_ascend_config().eplb_config.dynamic_eplb:
@@ -106,6 +144,9 @@ def init_ascend_model_parallel(
         _FC3_QUANT_X = init_model_parallel_group(
             group_ranks, get_world_group().local_rank, backend, group_name="fc3_quant_x"
         )
+
+    if parallel_config.enable_edge_cloud:
+        return
 
     # Initialize fine-grained TP process groups on Ascend for four components:
     # 1. LM Head: output logits projection (`lmhead_tensor_parallel_size`)
@@ -339,3 +380,70 @@ def destroy_ascend_model_parallel():
     if _DYNAMIC_EPLB:
         _DYNAMIC_EPLB.destroy()
     _DYNAMIC_EPLB = None
+
+
+def edge_cloud_broadcast_recv() -> tuple[
+    dict[str, torch.Tensor | Any] | None,
+    list[Handle],
+    list[Callable[[], None]],
+]:
+    """Receive PP tensors and broadcast them within the local edge/cloud TP group."""
+    pp_group = get_pp_group()
+    tp_group = get_tp_group()
+    is_pp_npu0 = pp_group.world_size == 2
+
+    if is_pp_npu0:
+        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
+        assert tensor_dict is not None, (
+            "edge_cloud_broadcast_recv: PP tensor_dict is None, "
+            "sender may have failed."
+        )
+
+        metadata_list, _ = _split_tensor_dict(tensor_dict)
+        tp_group.broadcast_object(metadata_list, src=0)
+
+        def broadcast_postprocess():
+            _, tensor_list = _split_tensor_dict(tensor_dict) if tensor_dict else (None, [])
+            handles = []
+            for tensor in tensor_list:
+                if tensor.numel() == 0:
+                    continue
+                group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
+                handles.append(
+                    torch.distributed.broadcast(
+                        tensor, src=tp_group.ranks[0], group=group, async_op=True
+                    )
+                )
+            for handle in handles:
+                handle.wait()
+
+        comm_postprocess.append(broadcast_postprocess)
+        return tensor_dict, comm_handles, comm_postprocess
+
+    metadata_list = tp_group.broadcast_object(None, src=0)
+    if metadata_list is None:
+        metadata_list = []
+    recv_tensor_dict: dict[str, torch.Tensor | Any] = {}
+
+    for key, value in metadata_list:
+        if isinstance(value, TensorMetadata):
+            tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+            recv_tensor_dict[key] = tensor
+        else:
+            recv_tensor_dict[key] = value
+
+    def broadcast_postprocess():
+        handles = []
+        for tensor in recv_tensor_dict.values():
+            if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+                continue
+            group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
+            handles.append(
+                torch.distributed.broadcast(
+                    tensor, src=tp_group.ranks[0], group=group, async_op=True
+                )
+            )
+        for handle in handles:
+            handle.wait()
+
+    return recv_tensor_dict, [], [broadcast_postprocess]
